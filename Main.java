@@ -1,6 +1,7 @@
 import java.time.LocalDate;
 import java.time.format.DateTimeParseException;
 import java.util.*;
+import java.util.function.Predicate;
 
 /** Console menu for the Hotel Room Booking System. */
 public class Main {
@@ -59,12 +60,19 @@ public class Main {
         if (room == null || !free.contains(room)) { System.out.println("That room is not available."); return; }
 
         System.out.println("\n--- Customer details ---");
-        String name = readNonEmpty("Name: ");
-        String phone = readPhone();
-        String email = readNonEmpty("Email: ");
-        String idProof = readNonEmpty("ID proof (e.g. Aadhaar / Passport no.): ");
+        String name = readValid("Name: ", Customer::isValidName, "Use letters only (at least 2).");
+        String phone = readValid("Phone (10 digits): ", Customer::isValidPhone, "Please enter exactly 10 digits.");
+        String email = readValid("Email: ", Customer::isValidEmail, "Enter a valid email, e.g. name@example.com");
+        String idProof = readValid("ID proof (e.g. Aadhaar / Passport no.): ", Customer::isValidIdProof,
+                "Use 4-24 letters/digits.");
 
-        Booking b = hotel.book(new Customer(name, phone, email, idProof), room, d[0], d[1]);
+        Booking b;
+        try {
+            b = hotel.book(new Customer(name, phone, email, idProof), room, d[0], d[1]);
+        } catch (IllegalArgumentException e) {
+            System.out.println("Booking failed: " + e.getMessage());
+            return;
+        }
         if (b == null) { System.out.println("Booking failed: room no longer available."); return; }
         System.out.println("\nBooking confirmed!");
         b.print();
@@ -75,6 +83,11 @@ public class Main {
         Booking b = hotel.findBooking(id);
         if (b == null) { System.out.println("No booking found with ID " + id); return; }
         if (b.isCancelled()) { System.out.println("This booking is already cancelled."); return; }
+        if (!b.canCancel()) {
+            System.out.println("This stay has already started or finished, so it can't be cancelled (status: "
+                    + b.getStatus() + ").");
+            return;
+        }
         b.print();
         System.out.print("Cancel this booking? (y/n): ");
         if (in.nextLine().trim().equalsIgnoreCase("y")) {
@@ -99,7 +112,7 @@ public class Main {
         for (Booking b : hotel.getBookings())
             System.out.printf("%-6d %-18s %-5d %-11s %-11s %,-12.2f %s%n", b.getId(), b.getCustomer().getName(),
                     b.getRoom().getNumber(), b.getCheckIn(), b.getCheckOut(), b.getTotal(),
-                    b.isCancelled() ? "Cancelled" : "Confirmed");
+                    b.getStatus());
     }
 
     // ---------- input helpers ----------
@@ -124,18 +137,13 @@ public class Main {
         catch (NumberFormatException e) { return -1; }
     }
 
-    private static String readNonEmpty(String prompt) {
-        String s;
-        do { System.out.print(prompt); s = in.nextLine().trim(); } while (s.isEmpty());
-        return s;
-    }
-
-    private static String readPhone() {
+    /** Keeps asking until the input passes the given check. */
+    private static String readValid(String prompt, Predicate<String> check, String hint) {
         while (true) {
-            System.out.print("Phone (10 digits): ");
-            String p = in.nextLine().trim();
-            if (p.matches("\\d{10}")) return p;
-            System.out.println("Please enter exactly 10 digits.");
+            System.out.print(prompt);
+            String s = in.nextLine().trim();
+            if (check.test(s)) return s;
+            System.out.println(hint);
         }
     }
 }

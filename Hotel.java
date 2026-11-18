@@ -44,8 +44,17 @@ public class Hotel {
         return list;
     }
 
-    /** Creates a booking, or returns null if the room is not free for those dates. */
+    /**
+     * Creates a booking, or returns null if the room is not free for those dates.
+     * @throws IllegalArgumentException if the room, customer or dates are invalid
+     */
     public Booking book(Customer c, Room room, LocalDate in, LocalDate out) {
+        if (c == null || room == null || in == null || out == null)
+            throw new IllegalArgumentException("Customer, room and dates are required.");
+        if (in.isBefore(LocalDate.now()))
+            throw new IllegalArgumentException("Check-in cannot be in the past.");
+        if (!out.isAfter(in))
+            throw new IllegalArgumentException("Check-out must be after check-in.");
         if (!isAvailable(room, in, out)) return null;
         Booking b = new Booking(nextId++, c, room, in, out);
         bookings.add(b);
@@ -53,9 +62,10 @@ public class Hotel {
         return b;
     }
 
+    /** Cancels an upcoming booking. Returns false if it does not exist, is already cancelled, or has started. */
     public boolean cancel(int bookingId) {
         Booking b = findBooking(bookingId);
-        if (b == null || b.isCancelled()) return false;
+        if (b == null || !b.canCancel()) return false;
         b.cancel();
         save();
         return true;
@@ -77,22 +87,33 @@ public class Hotel {
 
     private void load() {
         if (!dataFile.exists()) return;
+        int lineNo = 0, skipped = 0;
         try (BufferedReader r = new BufferedReader(new FileReader(dataFile))) {
             String line;
             while ((line = r.readLine()) != null) {
-                String[] p = line.split("\\|", -1);
-                if (p.length < 9) continue;
-                Room room = findRoom(Integer.parseInt(p[5]));
-                if (room == null) continue;
-                Booking b = new Booking(Integer.parseInt(p[0]), new Customer(p[1], p[2], p[3], p[4]),
-                        room, LocalDate.parse(p[6]), LocalDate.parse(p[7]));
-                if (Boolean.parseBoolean(p[8])) b.cancel();
-                bookings.add(b);
-                nextId = Math.max(nextId, b.getId() + 1);
+                lineNo++;
+                if (line.isBlank()) continue;
+                // each line is parsed on its own so one bad line doesn't lose the rest
+                try {
+                    String[] p = line.split("\\|", -1);
+                    if (p.length < 9) throw new IllegalArgumentException("expected 9 fields, found " + p.length);
+                    Room room = findRoom(Integer.parseInt(p[5].trim()));
+                    if (room == null) throw new IllegalArgumentException("unknown room " + p[5]);
+                    Booking b = new Booking(Integer.parseInt(p[0].trim()), new Customer(p[1], p[2], p[3], p[4]),
+                            room, LocalDate.parse(p[6].trim()), LocalDate.parse(p[7].trim()));
+                    if (Boolean.parseBoolean(p[8].trim())) b.cancel();
+                    if (findBooking(b.getId()) != null) throw new IllegalArgumentException("duplicate booking ID " + b.getId());
+                    bookings.add(b);
+                    nextId = Math.max(nextId, b.getId() + 1);
+                } catch (RuntimeException e) {
+                    skipped++;
+                    System.out.println("Warning: skipped line " + lineNo + " of " + dataFile.getName() + " (" + e.getMessage() + ")");
+                }
             }
-        } catch (Exception e) {
+        } catch (IOException e) {
             System.out.println("Warning: could not read saved data (" + e.getMessage() + ")");
         }
+        if (skipped > 0) System.out.println("Loaded " + bookings.size() + " booking(s), skipped " + skipped + " bad line(s).");
     }
 
     private String clean(String s) { return s.replace("|", "/"); }
