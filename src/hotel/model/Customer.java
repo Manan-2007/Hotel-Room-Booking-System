@@ -1,3 +1,5 @@
+package hotel.model;
+
 /** Customer details stored with every booking. */
 public class Customer {
     private final String name;

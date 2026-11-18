@@ -1,8 +1,10 @@
+package hotel.model;
+
 import java.time.LocalDate;
 import java.time.temporal.ChronoUnit;
 
 /** One reservation: a customer, a room and a stay period. */
-public class Booking {
+public class Booking implements Identifiable {
     /** GST slab limit: rooms up to this nightly rate are taxed at the lower rate. */
     public static final double GST_SLAB_LIMIT = 7500;
     public static final double GST_LOW = 0.05;
@@ -23,6 +25,7 @@ public class Booking {
         this.checkOut = checkOut;
     }
 
+    @Override
     public int getId() { return id; }
     public Customer getCustomer() { return customer; }
     public Room getRoom() { return room; }

@@ -1,3 +1,13 @@
+package hotel.ui;
+
+import hotel.model.Booking;
+import hotel.model.Customer;
+import hotel.model.Room;
+import hotel.model.RoomType;
+import hotel.service.BookingException;
+import hotel.service.Hotel;
+import hotel.service.Reports;
+
 import javax.swing.*;
 import javax.swing.border.CompoundBorder;
 import javax.swing.border.EmptyBorder;
@@ -17,17 +27,24 @@ import java.awt.event.FocusEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.event.MouseMotionAdapter;
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
 import java.awt.geom.RoundRectangle2D;
 import java.time.LocalDate;
+import java.io.IOException;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
 import java.util.Date;
 import java.util.HashSet;
-import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
 
@@ -76,20 +93,21 @@ public class HotelGUI {
     static final Font F_BADGE = new Font(FONT_FAMILY, Font.BOLD, 10);
 
     private final Hotel hotel = new Hotel("bookings.txt");
+    private final Reports reports = new Reports(hotel);
     private JFrame frame;
     private Room selectedRoom;
 
     private final JPanel root = new JPanel(new BorderLayout());
     private final CardLayout pages = new CardLayout();
     private final JPanel pageHolder = new JPanel(pages);
-    private NavButton navBook, navBookings;
+    private NavButton navBook, navBookings, navReports;
 
     static final String ALL_TYPES = "All types";
     static final int CARD_MIN_W = 150, CARD_H = 128, GRID_GAP = 14;
 
     private final JSpinner inSpinner = dateSpinner();
     private final JSpinner nightsSpinner = new JSpinner(new SpinnerNumberModel(2, 1, 30, 1));
-    private final JComboBox<String> typeFilter = new JComboBox<>(roomTypes());
+    private final JComboBox<Object> typeFilter = new JComboBox<>(roomTypeOptions());
     private final JLabel outLabel = new JLabel();
     private final JLabel statusLabel = new JLabel();
     private final JPanel roomsGrid = new JPanel(new GridLayout(0, 4, GRID_GAP, GRID_GAP));
@@ -99,23 +117,25 @@ public class HotelGUI {
             sumTaxKey = new JLabel("GST"), sumTax = new JLabel("-"), sumTotal = new JLabel("Rs. 0.00");
 
     private final JLabel chipAvail = new JLabel("0"), chipActive = new JLabel("0");
-    private final DefaultTableModel bookingModel = new DefaultTableModel(
-            new String[]{"ID", "Customer", "Phone", "Room", "Check-in", "Check-out", "Total (Rs.)", "Status"}, 0) {
-        public boolean isCellEditable(int r, int c) { return false; }
-        // real column types so sorting is numeric / by date instead of alphabetical
-        public Class<?> getColumnClass(int c) {
-            switch (c) {
-                case 0: case 3: return Integer.class;
-                case 4: case 5: return LocalDate.class;
-                case 6: return Double.class;
-                default: return String.class;
-            }
-        }
-    };
+    private final DefaultTableModel bookingModel = readOnlyModel(
+            new String[]{"ID", "Customer", "Phone", "Room", "Check-in", "Check-out", "Total (Rs.)", "Status"},
+            Integer.class, String.class, String.class, Integer.class, LocalDate.class, LocalDate.class, Double.class, String.class);
     private final JTable bookingTable = new JTable(bookingModel);
     private final TableRowSorter<DefaultTableModel> sorter = new TableRowSorter<>(bookingModel);
     private final JTextField searchField = field("");
     private RoundButton billButton, cancelButton;
+
+    // reports page
+    private final JLabel repRevenue = new JLabel(), repRevenueSub = new JLabel(), repBookings = new JLabel(),
+            repBookingsSub = new JLabel(), repCancelled = new JLabel(), repCancelledSub = new JLabel(),
+            repOccupied = new JLabel(), repOccupiedSub = new JLabel(), repAsOf = new JLabel();
+    private final DefaultTableModel byTypeModel = readOnlyModel(new String[]{"Type", "Rooms", "Booked", "Revenue", "Share"},
+            String.class, Long.class, Long.class, String.class, String.class);
+    private final DefaultTableModel arrivalsModel = readOnlyModel(new String[]{"Check-in", "ID", "Guest", "Room", "Nights"},
+            LocalDate.class, Integer.class, String.class, Integer.class, Long.class);
+
+    /** The date the screen was last refreshed for; written on the Swing thread, read by the day watcher. */
+    private volatile LocalDate shownDay = LocalDate.now();
 
     public HotelGUI() {
         root.setBackground(BG);
@@ -123,6 +143,7 @@ public class HotelGUI {
         pageHolder.setOpaque(false);
         pageHolder.add(buildBookPage(), "book");
         pageHolder.add(buildBookingsPage(), "bookings");
+        pageHolder.add(buildReportsPage(), "reports");
         root.add(pageHolder, BorderLayout.CENTER);
 
         inSpinner.addChangeListener(e -> refreshRooms());
@@ -135,13 +156,26 @@ public class HotelGUI {
         });
         refreshRooms();
         refreshBookings();
+        refreshReports();
     }
 
     public JComponent getContent() { return root; }
 
     public void show() {
         frame = new JFrame("Grand Stay Hotel - Room Booking System");
-        frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        // save once more before exiting; save() is synchronized, so this also waits for any background save
+        frame.setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
+        frame.addWindowListener(new WindowAdapter() {
+            public void windowClosing(WindowEvent e) {
+                try {
+                    hotel.save();
+                } catch (IOException ex) {
+                    if (JOptionPane.showConfirmDialog(frame, "Bookings could not be saved (" + ex.getMessage()
+                            + ").\nClose anyway?", "Save failed", JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION) return;
+                }
+                System.exit(0);
+            }
+        });
         frame.setContentPane(root);
         // never open bigger than the usable screen area (e.g. 1366x768 laptops with a taskbar)
         Rectangle screen = GraphicsEnvironment.getLocalGraphicsEnvironment().getMaximumWindowBounds();
@@ -149,6 +183,7 @@ public class HotelGUI {
         frame.setSize(Math.min(1100, screen.width), Math.min(760, screen.height));
         frame.setLocationRelativeTo(null);
         frame.setVisible(true);
+        startDayWatcher();
     }
 
     // ---------- header ----------
@@ -181,11 +216,14 @@ public class HotelGUI {
 
         navBook = new NavButton("Book a Room");
         navBookings = new NavButton("Bookings");
+        navReports = new NavButton("Reports");
         ButtonGroup bg = new ButtonGroup();
         bg.add(navBook);
         bg.add(navBookings);
+        bg.add(navReports);
         navBook.addActionListener(e -> showPage("book"));
         navBookings.addActionListener(e -> showPage("bookings"));
+        navReports.addActionListener(e -> showPage("reports"));
         navBook.setSelected(true);
 
         JPanel right = new JPanel(new GridBagLayout());
@@ -198,6 +236,7 @@ public class HotelGUI {
         right.add(navBook, c);
         c.insets = new Insets(0, 6, 0, 0);
         right.add(navBookings, c);
+        right.add(navReports, c);
 
         h.add(left, BorderLayout.WEST);
         h.add(right, BorderLayout.EAST);
@@ -223,8 +262,11 @@ public class HotelGUI {
 
     void showPage(String name) {
         pages.show(pageHolder, name);
-        (name.equals("book") ? navBook : navBookings).setSelected(true);
-        if (name.equals("bookings")) refreshBookings();
+        switch (name) {
+            case "bookings": navBookings.setSelected(true); refreshBookings(); break;
+            case "reports": navReports.setSelected(true); refreshReports(); break;
+            default: navBook.setSelected(true);
+        }
     }
 
     // ---------- booking page ----------
@@ -409,30 +451,12 @@ public class HotelGUI {
         top.add(search, BorderLayout.EAST);
         page.add(top, BorderLayout.NORTH);
 
-        bookingTable.setRowHeight(40);
-        bookingTable.setShowGrid(false);
-        bookingTable.setShowHorizontalLines(true);
-        bookingTable.setGridColor(new Color(0xF1F5F9));
-        bookingTable.setIntercellSpacing(new Dimension(0, 1));
-        bookingTable.setFont(F);
-        bookingTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-        bookingTable.setSelectionBackground(PRIMARY_LIGHT);
-        bookingTable.setSelectionForeground(TEXT);
-        bookingTable.setFillsViewportHeight(true);
-
         // click a header to sort; newest bookings first by default
         bookingTable.setRowSorter(sorter);
         sorter.setSortKeys(List.of(new RowSorter.SortKey(0, SortOrder.DESCENDING)));
 
-        RowRenderer rowRenderer = new RowRenderer();
-        bookingTable.setDefaultRenderer(Object.class, rowRenderer);
-        bookingTable.setDefaultRenderer(Number.class, rowRenderer);
-        bookingTable.setDefaultRenderer(Double.class, rowRenderer);
-        bookingTable.getTableHeader().setDefaultRenderer(new HeaderRenderer());
-        bookingTable.getTableHeader().setReorderingAllowed(false);
-        bookingTable.getTableHeader().setPreferredSize(new Dimension(0, 40));
-        bookingTable.getColumnModel().getColumn(0).setMaxWidth(80);
-        bookingTable.getColumnModel().getColumn(3).setMaxWidth(80);
+        RowRenderer rowRenderer = styleTable(bookingTable);
+        fixedWidths(bookingTable, 80, -1, -1, 80);
 
         bookingTable.addMouseMotionListener(new MouseMotionAdapter() {
             public void mouseMoved(MouseEvent e) {
@@ -457,10 +481,7 @@ public class HotelGUI {
         });
         bookingTable.getSelectionModel().addListSelectionListener(e -> updateBookingButtons());
 
-        JScrollPane sp = new JScrollPane(bookingTable);
-        sp.setBorder(new LineBorder(BORDER, 1, true));
-        sp.getViewport().setBackground(Color.WHITE);
-        page.add(sp, BorderLayout.CENTER);
+        page.add(tableScroll(bookingTable), BorderLayout.CENTER);
 
         billButton = new RoundButton("View Bill", NAVY2, Color.WHITE);
         billButton.addActionListener(e -> { Booking b = selectedBooking(); if (b != null) showBill(b); });
@@ -480,6 +501,105 @@ public class HotelGUI {
         return page;
     }
 
+    // ---------- reports page ----------
+    private JComponent buildReportsPage() {
+        JPanel page = new JPanel(new BorderLayout(0, 14));
+        page.setOpaque(false);
+        page.setBorder(new EmptyBorder(18, 28, 20, 28));
+
+        JLabel t = new JLabel("Reports");
+        t.setFont(F_HEAD);
+        t.setForeground(TEXT);
+        repAsOf.setFont(F_CAPTION);
+        repAsOf.setForeground(MUTED);
+        JPanel top = new JPanel(new BorderLayout());
+        top.setOpaque(false);
+        top.add(t, BorderLayout.WEST);
+        top.add(repAsOf, BorderLayout.EAST);
+
+        JPanel tiles = new JPanel(new GridLayout(1, 4, 14, 0));
+        tiles.setOpaque(false);
+        tiles.add(tile("Booked revenue", repRevenue, repRevenueSub));
+        tiles.add(tile("Bookings", repBookings, repBookingsSub));
+        tiles.add(tile("Cancelled", repCancelled, repCancelledSub));
+        tiles.add(tile("Occupied tonight", repOccupied, repOccupiedSub));
+
+        JPanel north = new JPanel(new BorderLayout(0, 14));
+        north.setOpaque(false);
+        north.add(top, BorderLayout.NORTH);
+        north.add(tiles, BorderLayout.CENTER);
+        page.add(north, BorderLayout.NORTH);
+
+        JTable byType = new JTable(byTypeModel);
+        styleTable(byType);
+        fixedWidths(byType, 84, 78, 86, -1, 70);
+        JTable arrivals = new JTable(arrivalsModel);
+        styleTable(arrivals);
+        fixedWidths(arrivals, 108, 62, -1, 70, 80);
+
+        JPanel tables = new JPanel(new GridLayout(1, 2, 14, 0));
+        tables.setOpaque(false);
+        tables.add(titled("Revenue by room type", tableScroll(byType)));
+        tables.add(titled("Check-ins in the next 7 days", tableScroll(arrivals)));
+        page.add(tables, BorderLayout.CENTER);
+        return page;
+    }
+
+    private JComponent tile(String caption, JLabel value, JLabel sub) {
+        RoundedPanel p = new RoundedPanel(Color.WHITE, BORDER, 14);
+        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
+        p.setBorder(new EmptyBorder(14, 16, 14, 16));
+        JLabel cap = caption(caption);
+        value.setFont(F_TOTAL);
+        value.setForeground(TEXT);
+        sub.setFont(F_CAPTION);
+        sub.setForeground(MUTED);
+        p.add(cap);
+        p.add(Box.createVerticalStrut(6));
+        p.add(value);
+        p.add(Box.createVerticalStrut(4));
+        p.add(sub);
+        return p;
+    }
+
+    private static JComponent titled(String title, JComponent body) {
+        JPanel p = new JPanel(new BorderLayout(0, 8));
+        p.setOpaque(false);
+        JLabel l = new JLabel(title);
+        l.setFont(F_SUBHEAD);
+        l.setForeground(TEXT);
+        p.add(l, BorderLayout.NORTH);
+        p.add(body, BorderLayout.CENTER);
+        return p;
+    }
+
+    private void refreshReports() {
+        repAsOf.setText("As of " + LocalDate.now());
+        repRevenue.setText(String.format("Rs. %,.0f", reports.totalRevenue()));
+        repRevenueSub.setText("incl. GST, excl. cancelled");
+        repBookings.setText(String.valueOf(reports.keptBookings()));
+        repBookingsSub.setText(String.format("average stay %.1f night(s)", reports.averageNights()));
+        repCancelled.setText(String.valueOf(reports.cancelledBookings()));
+        repCancelledSub.setText(String.format("%.0f%% of %d booking(s)", reports.cancellationRate() * 100, reports.totalBookings()));
+        long occ = reports.roomsOccupiedTonight(), total = reports.totalRooms();
+        repOccupied.setText(String.format("%.0f%%", total == 0 ? 0 : occ * 100.0 / total));
+        repOccupiedSub.setText(occ + " of " + total + " rooms");
+
+        Map<RoomType, Long> rooms = reports.roomsByType(), count = reports.bookingsByType();
+        Map<RoomType, Double> revenue = reports.revenueByType();
+        double all = reports.totalRevenue();
+        byTypeModel.setRowCount(0);
+        for (RoomType type : RoomType.values()) {
+            double rev = revenue.getOrDefault(type, 0.0);
+            byTypeModel.addRow(new Object[]{type.getLabel(), rooms.getOrDefault(type, 0L), count.getOrDefault(type, 0L),
+                    String.format("Rs. %,.0f", rev), all == 0 ? "-" : String.format("%.0f%%", rev * 100 / all)});
+        }
+        arrivalsModel.setRowCount(0);
+        for (Booking b : reports.upcomingCheckIns(7))
+            arrivalsModel.addRow(new Object[]{b.getCheckIn(), b.getId(), b.getCustomer().getName(),
+                    b.getRoom().getNumber(), b.getNights()});
+    }
+
     // ---------- logic ----------
     private LocalDate[] dates() {
         Object v = inSpinner.getValue();
@@ -489,11 +609,12 @@ public class HotelGUI {
         return new LocalDate[]{in, in.plusDays((Integer) nightsSpinner.getValue())};
     }
 
-    private String[] roomTypes() {
-        Set<String> types = new LinkedHashSet<>();
-        types.add(ALL_TYPES);
-        for (Room r : hotel.getAllRooms()) types.add(r.getType());
-        return types.toArray(new String[0]);
+    /** "All types" followed by every RoomType. */
+    private static Object[] roomTypeOptions() {
+        List<Object> options = new ArrayList<>();
+        options.add(ALL_TYPES);
+        options.addAll(Arrays.asList(RoomType.values()));
+        return options.toArray();
     }
 
     private void refreshRooms() {
@@ -512,14 +633,15 @@ public class HotelGUI {
             return;
         }
         outLabel.setText("Check-out " + d[1] + "  •");
-        String type = (String) typeFilter.getSelectedItem();
-        boolean allTypes = type == null || ALL_TYPES.equals(type);
+        Object chosen = typeFilter.getSelectedItem();
+        RoomType type = chosen instanceof RoomType ? (RoomType) chosen : null;
+        boolean allTypes = type == null;
         int freeAll = 0, freeShown = 0, shown = 0;
         boolean selectionStillFree = false;
         for (Room r : hotel.getAllRooms()) {
             boolean ok = hotel.isAvailable(r, d[0], d[1]);
             if (ok) freeAll++;
-            if (!allTypes && !r.getType().equals(type)) continue;
+            if (!allTypes && r.getType() != type) continue;
             shown++;
             if (ok) freeShown++;
             boolean sel = ok && selectedRoom != null && selectedRoom.getNumber() == r.getNumber();
@@ -588,16 +710,18 @@ public class HotelGUI {
         Booking b;
         try {
             b = hotel.book(new Customer(name, phone, email, id), hotel.findRoom(selectedRoom.getNumber()), d[0], d[1]);
-        } catch (IllegalArgumentException ex) {
+        } catch (BookingException ex) {
+            // one catch covers both InvalidBookingException and RoomNotAvailableException
             error(ex.getMessage());
             refreshRooms();
             return;
         }
-        if (b == null) { error("That room is no longer available."); refreshRooms(); return; }
+        saveInBackground();
         nameField.setText(""); phoneField.setText(""); emailField.setText(""); idField.setText("");
         selectedRoom = null;
         refreshRooms();
         refreshBookings();
+        refreshReports();
         showBill(b);
     }
 
@@ -634,8 +758,10 @@ public class HotelGUI {
         if (JOptionPane.showConfirmDialog(frame, "Cancel booking " + b.getId() + " for "
                 + b.getCustomer().getName() + "?", "Confirm cancellation", JOptionPane.YES_NO_OPTION) == JOptionPane.YES_OPTION) {
             hotel.cancel(b.getId());
+            saveInBackground();
             refreshBookings();
             refreshRooms();
+            refreshReports();
         }
     }
 
@@ -655,6 +781,55 @@ public class HotelGUI {
         String q = searchField.getText().trim();
         // search the ID, customer and phone columns, ignoring case
         sorter.setRowFilter(q.isEmpty() ? null : RowFilter.regexFilter("(?i)" + Pattern.quote(q), 0, 1, 2));
+    }
+
+    // ---------- background work ----------
+    /** Writes bookings.txt on a worker thread so a slow disk never freezes the window. */
+    private void saveInBackground() {
+        new SwingWorker<Void, Void>() {
+            protected Void doInBackground() throws IOException {
+                hotel.save();            // runs on a background thread
+                return null;
+            }
+            protected void done() {      // runs back on the Swing thread, so it may show a dialog
+                try {
+                    get();
+                } catch (ExecutionException ex) {
+                    error("Your booking is made, but it could not be saved to disk:\n" + ex.getCause().getMessage());
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }.execute();
+    }
+
+    /**
+     * Statuses (Upcoming -> Ongoing -> Completed) and the earliest allowed check-in depend on today's date.
+     * A background thread checks once a minute; when the date has changed it asks the Swing thread to refresh.
+     * Checking every minute (not one timer for midnight) still works after the laptop wakes from sleep.
+     */
+    private void startDayWatcher() {
+        ScheduledExecutorService watcher = Executors.newSingleThreadScheduledExecutor(task -> {
+            Thread t = new Thread(task, "day-watcher");
+            t.setDaemon(true);   // don't keep the program alive after the window closes
+            return t;
+        });
+        watcher.scheduleAtFixedRate(() -> {
+            if (!LocalDate.now().equals(shownDay)) SwingUtilities.invokeLater(this::onNewDay);
+        }, 1, 1, TimeUnit.MINUTES);
+    }
+
+    /** Called on the Swing thread when the date changes. */
+    void onNewDay() {
+        LocalDate today = LocalDate.now();
+        if (today.equals(shownDay)) return;
+        shownDay = today;
+        SpinnerDateModel m = (SpinnerDateModel) inSpinner.getModel();
+        m.setStart(toDate(today));
+        if (toLocal((Date) m.getValue()).isBefore(today)) m.setValue(toDate(today));
+        refreshRooms();
+        refreshBookings();
+        refreshReports();
     }
 
     // ---------- receipt ----------
@@ -732,6 +907,55 @@ public class HotelGUI {
         s.setPreferredSize(new Dimension(width, 36));
     }
 
+    // ---------- table helpers ----------
+    /** A table model whose cells can't be edited and whose columns sort by real type (number, date). */
+    static DefaultTableModel readOnlyModel(String[] columns, Class<?>... types) {
+        return new DefaultTableModel(columns, 0) {
+            public boolean isCellEditable(int r, int c) { return false; }
+            public Class<?> getColumnClass(int c) { return types[c]; }
+        };
+    }
+
+    /** Shared look for every table; returns the row renderer so callers can add hover effects. */
+    static RowRenderer styleTable(JTable t) {
+        t.setRowHeight(40);
+        t.setShowGrid(false);
+        t.setShowHorizontalLines(true);
+        t.setGridColor(new Color(0xF1F5F9));
+        t.setIntercellSpacing(new Dimension(0, 1));
+        t.setFont(F);
+        t.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        t.setSelectionBackground(PRIMARY_LIGHT);
+        t.setSelectionForeground(TEXT);
+        t.setFillsViewportHeight(true);
+        RowRenderer rowRenderer = new RowRenderer();
+        t.setDefaultRenderer(Object.class, rowRenderer);
+        t.setDefaultRenderer(Number.class, rowRenderer);
+        t.setDefaultRenderer(Double.class, rowRenderer);
+        t.getTableHeader().setDefaultRenderer(new HeaderRenderer());
+        t.getTableHeader().setReorderingAllowed(false);
+        t.getTableHeader().setPreferredSize(new Dimension(0, 40));
+        return rowRenderer;
+    }
+
+    /** Gives columns a fixed width (-1 = flexible); flexible columns share whatever space is left. */
+    static void fixedWidths(JTable t, int... widths) {
+        for (int i = 0; i < widths.length; i++) {
+            if (widths[i] <= 0) continue;
+            javax.swing.table.TableColumn col = t.getColumnModel().getColumn(i);
+            col.setMinWidth(widths[i]);
+            col.setMaxWidth(widths[i]);
+            col.setPreferredWidth(widths[i]);
+        }
+    }
+
+    static JScrollPane tableScroll(JTable t) {
+        JScrollPane sp = new JScrollPane(t);
+        sp.setBorder(new LineBorder(BORDER, 1, true));
+        sp.getViewport().setBackground(Color.WHITE);
+        return sp;
+    }
+
     // ---------- small helpers ----------
     static JTextField field(String text) {
         JTextField f = new JTextField(text);
@@ -759,11 +983,11 @@ public class HotelGUI {
 
     static void left(JComponent c) { c.setAlignmentX(Component.LEFT_ALIGNMENT); }
 
-    static Color typeColor(String type) {
+    static Color typeColor(RoomType type) {
         switch (type) {
-            case "Single": return new Color(0x0284C7);
-            case "Double": return new Color(0x4F46E5);
-            case "Deluxe": return new Color(0x7C3AED);
+            case SINGLE: return new Color(0x0284C7);
+            case DOUBLE: return new Color(0x4F46E5);
+            case DELUXE: return new Color(0x7C3AED);
             default: return PRIMARY;
         }
     }

@@ -1,3 +1,15 @@
+package hotel.ui;
+
+import hotel.model.Booking;
+import hotel.model.Customer;
+import hotel.model.Room;
+import hotel.model.RoomType;
+import hotel.service.Hotel;
+import hotel.service.InvalidBookingException;
+import hotel.service.Reports;
+import hotel.service.RoomNotAvailableException;
+
+import java.io.IOException;
 import java.time.LocalDate;
 import java.time.format.DateTimeParseException;
 import java.util.*;
@@ -19,6 +31,7 @@ public class Main {
             System.out.println("4. Cancel a booking");
             System.out.println("5. View booking details / bill");
             System.out.println("6. List all bookings");
+            System.out.println("7. Reports");
             System.out.println("0. Exit");
             int choice = readInt("Choose an option: ");
             switch (choice) {
@@ -28,6 +41,7 @@ public class Main {
                 case 4: cancelBooking(); break;
                 case 5: viewBooking(); break;
                 case 6: listBookings(); break;
+                case 7: showReports(); break;
                 case 0: System.out.println("Thank you for using the system. Goodbye!"); return;
                 default: System.out.println("Invalid option, try again.");
             }
@@ -69,11 +83,14 @@ public class Main {
         Booking b;
         try {
             b = hotel.book(new Customer(name, phone, email, idProof), room, d[0], d[1]);
-        } catch (IllegalArgumentException e) {
+        } catch (RoomNotAvailableException e) {
+            System.out.println("Sorry, " + e.getMessage());
+            return;
+        } catch (InvalidBookingException e) {
             System.out.println("Booking failed: " + e.getMessage());
             return;
         }
-        if (b == null) { System.out.println("Booking failed: room no longer available."); return; }
+        save();
         System.out.println("\nBooking confirmed!");
         b.print();
     }
@@ -92,6 +109,7 @@ public class Main {
         System.out.print("Cancel this booking? (y/n): ");
         if (in.nextLine().trim().equalsIgnoreCase("y")) {
             hotel.cancel(id);
+            save();
             System.out.println("Booking " + id + " cancelled. Room is available again.");
         } else {
             System.out.println("Cancellation aborted.");
@@ -109,10 +127,45 @@ public class Main {
         if (hotel.getBookings().isEmpty()) { System.out.println("No bookings yet."); return; }
         System.out.printf("%-6s %-18s %-5s %-11s %-11s %-12s %s%n",
                 "ID", "Customer", "Room", "Check-in", "Check-out", "Total (Rs.)", "Status");
-        for (Booking b : hotel.getBookings())
+        List<Booking> list = hotel.getBookings();
+        list.sort(Hotel.BY_CHECK_IN);
+        for (Booking b : list)
             System.out.printf("%-6d %-18s %-5d %-11s %-11s %,-12.2f %s%n", b.getId(), b.getCustomer().getName(),
                     b.getRoom().getNumber(), b.getCheckIn(), b.getCheckOut(), b.getTotal(),
                     b.getStatus());
+    }
+
+    private static void showReports() {
+        Reports r = new Reports(hotel);
+        System.out.println("\n--- Reports (" + LocalDate.now() + ") ---");
+        System.out.printf("Booked revenue    : Rs. %,.2f (excluding cancellations)%n", r.totalRevenue());
+        System.out.printf("Bookings          : %d kept, %d cancelled (%.0f%%)%n",
+                r.keptBookings(), r.cancelledBookings(), r.cancellationRate() * 100);
+        System.out.printf("Average stay      : %.1f night(s)%n", r.averageNights());
+        System.out.printf("Occupied tonight  : %d of %d rooms%n", r.roomsOccupiedTonight(), r.totalRooms());
+
+        System.out.println("\nBy room type:");
+        Map<RoomType, Long> rooms = r.roomsByType(), count = r.bookingsByType();
+        Map<RoomType, Double> revenue = r.revenueByType();
+        for (RoomType t : RoomType.values())
+            System.out.printf("  %-7s %d room(s)  %3d booking(s)  Rs. %,12.2f%n", t, rooms.getOrDefault(t, 0L),
+                    count.getOrDefault(t, 0L), revenue.getOrDefault(t, 0.0));
+
+        System.out.println("\nCheck-ins in the next 7 days:");
+        List<Booking> soon = r.upcomingCheckIns(7);
+        if (soon.isEmpty()) System.out.println("  none");
+        for (Booking b : soon)
+            System.out.printf("  %s  #%d  %-18s room %d%n", b.getCheckIn(), b.getId(), b.getCustomer().getName(),
+                    b.getRoom().getNumber());
+    }
+
+    /** Writes bookings to disk straight away (the console has no other threads to hand this to). */
+    private static void save() {
+        try {
+            hotel.save();
+        } catch (IOException e) {
+            System.out.println("Warning: could not save data (" + e.getMessage() + ")");
+        }
     }
 
     // ---------- input helpers ----------
